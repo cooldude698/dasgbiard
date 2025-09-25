@@ -1,0 +1,421 @@
+from fastapi import FastAPI, APIRouter, HTTPException, Depends
+from dotenv import load_dotenv
+from starlette.middleware.cors import CORSMiddleware
+from motor.motor_asyncio import AsyncIOMotorClient
+import os
+import logging
+from pathlib import Path
+from pydantic import BaseModel, Field
+from typing import List, Optional
+import uuid
+from datetime import datetime, timezone, date, time
+from passlib.context import CryptContext
+import hashlib
+
+ROOT_DIR = Path(__file__).parent
+load_dotenv(ROOT_DIR / '.env')
+
+# MongoDB connection
+mongo_url = os.environ['MONGO_URL']
+client = AsyncIOMotorClient(mongo_url)
+db = client[os.environ['DB_NAME']]
+
+# Create the main app without a prefix
+app = FastAPI()
+
+# Create a router with the /api prefix
+api_router = APIRouter(prefix="/api")
+
+# Password hashing
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+# Helper functions
+def prepare_for_mongo(data):
+    """Convert Python objects to MongoDB-compatible format"""
+    if isinstance(data, dict):
+        for key, value in data.items():
+            if isinstance(value, date):
+                data[key] = value.isoformat()
+            elif isinstance(value, time):
+                data[key] = value.strftime('%H:%M:%S')
+            elif isinstance(value, datetime):
+                data[key] = value.isoformat()
+    return data
+
+def parse_from_mongo(item):
+    """Parse MongoDB data back to Python objects"""
+    if isinstance(item, dict):
+        for key, value in item.items():
+            if key.endswith('_date') and isinstance(value, str):
+                try:
+                    item[key] = datetime.fromisoformat(value).date()
+                except:
+                    pass
+            elif key.endswith('_time') and isinstance(value, str):
+                try:
+                    item[key] = datetime.strptime(value, '%H:%M:%S').time()
+                except:
+                    pass
+    return item
+
+# Models
+class Student(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    student_id: str
+    name: str
+    class_name: str
+    parent_access_code: str
+    email: Optional[str] = None
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+class StudentCreate(BaseModel):
+    student_id: str
+    name: str
+    class_name: str
+    email: Optional[str] = None
+
+class Course(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    course_code: str
+    course_name: str
+    room: str
+    instructor: str
+    schedule_time: str
+    schedule_day: str
+    duration_minutes: int = 60
+
+class CourseCreate(BaseModel):
+    course_code: str
+    course_name: str
+    room: str
+    instructor: str
+    schedule_time: str
+    schedule_day: str
+    duration_minutes: int = 60
+
+class Attendance(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    student_id: str
+    course_id: str
+    attendance_date: date
+    status: str  # "present", "absent", "late"
+    marked_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+class AttendanceCreate(BaseModel):
+    student_id: str
+    course_id: str
+    attendance_date: date
+    status: str
+
+class Performance(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    student_id: str
+    course_id: str
+    assessment_type: str  # "quiz", "assignment", "exam", "project"
+    assessment_name: str
+    score: float
+    max_score: float
+    grade: Optional[str] = None
+    feedback: Optional[str] = None
+    date_assessed: date
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+class PerformanceCreate(BaseModel):
+    student_id: str
+    course_id: str
+    assessment_type: str
+    assessment_name: str
+    score: float
+    max_score: float
+    grade: Optional[str] = None
+    feedback: Optional[str] = None
+    date_assessed: date
+
+class ParentLogin(BaseModel):
+    student_id: str
+    access_code: str
+
+class StatusCheck(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    client_name: str
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+class StatusCheckCreate(BaseModel):
+    client_name: str
+
+# Routes
+@api_router.get("/")
+async def root():
+    return {"message": "Academic Route Master API - Parent Portal Ready"}
+
+@api_router.post("/status", response_model=StatusCheck)
+async def create_status_check(input: StatusCheckCreate):
+    status_dict = input.dict()
+    status_obj = StatusCheck(**status_dict)
+    status_data = prepare_for_mongo(status_obj.dict())
+    _ = await db.status_checks.insert_one(status_data)
+    return status_obj
+
+@api_router.get("/status", response_model=List[StatusCheck])
+async def get_status_checks():
+    status_checks = await db.status_checks.find().to_list(1000)
+    return [StatusCheck(**parse_from_mongo(status_check)) for status_check in status_checks]
+
+# Student Management
+@api_router.post("/students", response_model=Student)
+async def create_student(student: StudentCreate):
+    # Generate parent access code
+    access_code = hashlib.md5(f"{student.student_id}{student.name}".encode()).hexdigest()[:8].upper()
+    
+    student_dict = student.dict()
+    student_dict['parent_access_code'] = access_code
+    student_obj = Student(**student_dict)
+    
+    # Check if student already exists
+    existing = await db.students.find_one({"student_id": student.student_id})
+    if existing:
+        raise HTTPException(status_code=400, detail="Student ID already exists")
+    
+    student_data = prepare_for_mongo(student_obj.dict())
+    await db.students.insert_one(student_data)
+    return student_obj
+
+@api_router.get("/students", response_model=List[Student])
+async def get_students():
+    students = await db.students.find().to_list(1000)
+    return [Student(**parse_from_mongo(student)) for student in students]
+
+# Course Management
+@api_router.post("/courses", response_model=Course)
+async def create_course(course: CourseCreate):
+    course_obj = Course(**course.dict())
+    course_data = prepare_for_mongo(course_obj.dict())
+    await db.courses.insert_one(course_data)
+    return course_obj
+
+@api_router.get("/courses", response_model=List[Course])
+async def get_courses():
+    courses = await db.courses.find().to_list(1000)
+    return [Course(**parse_from_mongo(course)) for course in courses]
+
+# Parent Authentication
+@api_router.post("/parent/login")
+async def parent_login(login_data: ParentLogin):
+    student = await db.students.find_one({"student_id": login_data.student_id})
+    if not student:
+        raise HTTPException(status_code=404, detail="Student not found")
+    
+    if student.get('parent_access_code') != login_data.access_code:
+        raise HTTPException(status_code=401, detail="Invalid access code")
+    
+    return {
+        "success": True,
+        "student": Student(**parse_from_mongo(student)),
+        "message": "Login successful"
+    }
+
+# Parent Dashboard Data
+@api_router.get("/parent/dashboard/{student_id}")
+async def get_parent_dashboard(student_id: str):
+    # Get student info
+    student = await db.students.find_one({"student_id": student_id})
+    if not student:
+        raise HTTPException(status_code=404, detail="Student not found")
+    
+    # Get courses for the student's class
+    courses = await db.courses.find().to_list(1000)
+    
+    # Get recent attendance (last 30 days)
+    today = datetime.now(timezone.utc).date()
+    attendance_records = await db.attendance.find({
+        "student_id": student_id
+    }).sort("attendance_date", -1).limit(30).to_list(30)
+    
+    # Get performance records
+    performance_records = await db.performance.find({
+        "student_id": student_id
+    }).sort("date_assessed", -1).limit(20).to_list(20)
+    
+    # Calculate attendance percentage
+    total_days = len(attendance_records)
+    present_days = len([a for a in attendance_records if a.get('status') == 'present'])
+    attendance_percentage = (present_days / total_days * 100) if total_days > 0 else 0
+    
+    # Calculate average performance
+    if performance_records:
+        total_percentage = sum([(p.get('score', 0) / p.get('max_score', 1)) * 100 for p in performance_records])
+        average_performance = total_percentage / len(performance_records)
+    else:
+        average_performance = 0
+    
+    return {
+        "student": Student(**parse_from_mongo(student)),
+        "courses": [Course(**parse_from_mongo(course)) for course in courses],
+        "attendance_records": [Attendance(**parse_from_mongo(att)) for att in attendance_records],
+        "performance_records": [Performance(**parse_from_mongo(perf)) for perf in performance_records],
+        "stats": {
+            "attendance_percentage": round(attendance_percentage, 1),
+            "average_performance": round(average_performance, 1),
+            "total_courses": len(courses),
+            "recent_assessments": len(performance_records)
+        }
+    }
+
+# Attendance Management
+@api_router.post("/attendance", response_model=Attendance)
+async def mark_attendance(attendance: AttendanceCreate):
+    # Check if attendance already marked for this student, course, and date
+    existing = await db.attendance.find_one({
+        "student_id": attendance.student_id,
+        "course_id": attendance.course_id,
+        "attendance_date": attendance.attendance_date.isoformat()
+    })
+    
+    if existing:
+        # Update existing record
+        update_data = prepare_for_mongo(attendance.dict())
+        await db.attendance.update_one(
+            {"id": existing["id"]},
+            {"$set": update_data}
+        )
+        return Attendance(**{**existing, **attendance.dict()})
+    else:
+        # Create new record
+        attendance_obj = Attendance(**attendance.dict())
+        attendance_data = prepare_for_mongo(attendance_obj.dict())
+        await db.attendance.insert_one(attendance_data)
+        return attendance_obj
+
+@api_router.get("/attendance/{student_id}")
+async def get_student_attendance(student_id: str, limit: int = 30):
+    attendance_records = await db.attendance.find({
+        "student_id": student_id
+    }).sort("attendance_date", -1).limit(limit).to_list(limit)
+    
+    return [Attendance(**parse_from_mongo(att)) for att in attendance_records]
+
+# Performance Management
+@api_router.post("/performance", response_model=Performance)
+async def add_performance(performance: PerformanceCreate):
+    performance_obj = Performance(**performance.dict())
+    performance_data = prepare_for_mongo(performance_obj.dict())
+    await db.performance.insert_one(performance_data)
+    return performance_obj
+
+@api_router.get("/performance/{student_id}")
+async def get_student_performance(student_id: str, limit: int = 20):
+    performance_records = await db.performance.find({
+        "student_id": student_id
+    }).sort("date_assessed", -1).limit(limit).to_list(limit)
+    
+    return [Performance(**parse_from_mongo(perf)) for perf in performance_records]
+
+# Initialize sample data
+@api_router.post("/init-sample-data")
+async def initialize_sample_data():
+    try:
+        # Check if data already exists
+        existing_students = await db.students.count_documents({})
+        if existing_students > 0:
+            return {"message": "Sample data already exists"}
+        
+        # Sample students
+        sample_students = [
+            {"student_id": "STU001", "name": "John Smith", "class_name": "Grade 10A", "email": "john.parent@email.com"},
+            {"student_id": "STU002", "name": "Emma Johnson", "class_name": "Grade 10A", "email": "emma.parent@email.com"},
+            {"student_id": "STU003", "name": "Michael Brown", "class_name": "Grade 10B", "email": "michael.parent@email.com"}
+        ]
+        
+        # Sample courses
+        sample_courses = [
+            {"course_code": "CS101", "course_name": "Data Structures", "room": "A-101", "instructor": "Dr. Adams", "schedule_time": "09:00", "schedule_day": "Monday"},
+            {"course_code": "MATH201", "course_name": "Calculus II", "room": "B-205", "instructor": "Prof. Wilson", "schedule_time": "11:00", "schedule_day": "Tuesday"},
+            {"course_code": "PHY301", "course_name": "Quantum Physics", "room": "C-102", "instructor": "Dr. Martinez", "schedule_time": "14:00", "schedule_day": "Wednesday"}
+        ]
+        
+        # Create students
+        students_created = []
+        for student_data in sample_students:
+            access_code = hashlib.md5(f"{student_data['student_id']}{student_data['name']}".encode()).hexdigest()[:8].upper()
+            student_data['parent_access_code'] = access_code
+            student_obj = Student(**student_data)
+            student_doc = prepare_for_mongo(student_obj.dict())
+            await db.students.insert_one(student_doc)
+            students_created.append(student_obj)
+        
+        # Create courses
+        courses_created = []
+        for course_data in sample_courses:
+            course_obj = Course(**course_data)
+            course_doc = prepare_for_mongo(course_obj.dict())
+            await db.courses.insert_one(course_doc)
+            courses_created.append(course_obj)
+        
+        # Create sample attendance and performance data
+        import random
+        today = datetime.now(timezone.utc).date()
+        
+        for student in students_created:
+            for i in range(10):  # Last 10 days
+                attendance_date = date(today.year, today.month, max(1, today.day - i))
+                for course in courses_created:
+                    # Random attendance
+                    status = random.choice(["present", "present", "present", "late", "absent"])
+                    attendance_obj = Attendance(
+                        student_id=student.student_id,
+                        course_id=course.id,
+                        attendance_date=attendance_date,
+                        status=status
+                    )
+                    attendance_doc = prepare_for_mongo(attendance_obj.dict())
+                    await db.attendance.insert_one(attendance_doc)
+                    
+                    # Random performance (every few days)
+                    if i % 3 == 0:
+                        score = random.uniform(70, 95)
+                        max_score = 100
+                        grade = "A" if score >= 90 else "B" if score >= 80 else "C"
+                        
+                        performance_obj = Performance(
+                            student_id=student.student_id,
+                            course_id=course.id,
+                            assessment_type=random.choice(["quiz", "assignment", "exam"]),
+                            assessment_name=f"{course.course_name} Assessment {i+1}",
+                            score=score,
+                            max_score=max_score,
+                            grade=grade,
+                            date_assessed=attendance_date
+                        )
+                        performance_doc = prepare_for_mongo(performance_obj.dict())
+                        await db.performance.insert_one(performance_doc)
+        
+        return {
+            "message": "Sample data initialized successfully",
+            "students_created": len(students_created),
+            "courses_created": len(courses_created)
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error initializing sample data: {str(e)}")
+
+# Include the router in the main app
+app.include_router(api_router)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_credentials=True,
+    allow_origins=os.environ.get('CORS_ORIGINS', '*').split(','),
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+@app.on_event("shutdown")
+async def shutdown_db_client():
+    client.close()
